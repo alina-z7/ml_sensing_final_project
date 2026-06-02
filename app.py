@@ -402,23 +402,42 @@ def predict_uploaded(audio_file, accel_file):
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 css = """
-body, .gradio-container { background: #0f1117 !important; }
-.tab-nav button { background: #1a1d27 !important; color: #aaa !important; }
-.tab-nav button.selected { color: white !important; border-bottom: 2px solid #a78bfa !important; }
-.result-box { background: #1a1d27; border: 1px solid #333344; border-radius: 8px; padding: 16px; color: white; }
-footer { display: none !important; }
+body, .gradio-container { 
+    background: #0f1117 !important; 
+}
+.header {
+    text-align: center;
+}
+.tab-nav button { 
+    background: #1a1d27 !important; 
+    color: #aaa !important; 
+}
+.tab-nav button.selected { 
+    color: white !important; 
+    border-bottom: 2px solid #a78bfa !important; 
+}
+.result-box { 
+    background: #1a1d27; 
+    border: 1px solid #333344; 
+    border-radius: 8px; 
+    padding: 16px; 
+    color: white;
+}
+footer { 
+    display: none !important; 
+}
 """
 
-with gr.Blocks(theme=gr.themes.Base(), css=css, title="Breathing Pattern Classifier") as demo:
+with gr.Blocks(theme=gr.Theme.from_hub("Nymbo/Nymbo_Theme"), css=css, title="Breathing Pattern Classifier") as demo:
 
     gr.Markdown("""
 # 🫁 Breathing Pattern Classifier
 **ML & Sensing Final Project** — Maanvi Sarwadi, Katie Jiang, Aanand Patel, Alina Zacaria, Hayah Ubaid
-""")
+""", elem_classes=["header"])
 
     with gr.Tabs():
 
-        with gr.TabItem("🔬 Classify Recording"):
+        with gr.TabItem("Classify Recording"):
             gr.Markdown("Upload an `Accelerometer.csv` from PhyPhox and optionally a `.wav` audio file.")
             with gr.Row():
                 with gr.Column(scale=1):
@@ -434,7 +453,7 @@ with gr.Blocks(theme=gr.themes.Base(), css=css, title="Breathing Pattern Classif
                               [audio_input, accel_input],
                               [result_out, accel_plot_out, feature_plot_out, feature_table_out])
 
-        with gr.TabItem("📡 Live Stream (PhyPhox)"):
+        with gr.TabItem("Live Stream (PhyPhox)"):
             gr.Markdown("""
 **How to connect:**
 1. Open PhyPhox → *Acceleration (without g)* → tap **⋮ → Remote Access**
@@ -446,7 +465,7 @@ with gr.Blocks(theme=gr.themes.Base(), css=css, title="Breathing Pattern Classif
                 ip_input    = gr.Textbox(label="PhyPhox IP Address", placeholder="e.g. 192.168.1.5", scale=3)
                 start_btn   = gr.Button("▶ Start", variant="primary", scale=1)
                 stop_btn    = gr.Button("⏹ Stop", variant="secondary", scale=1)
-                refresh_btn = gr.Button("🔄 Refresh", variant="secondary", scale=1)
+                refresh_btn = gr.Button("Refresh", variant="secondary", scale=1)
 
             stream_status = gr.Markdown("_Stream idle_")
             live_plot     = gr.Plot(label="Live Signal")
@@ -463,7 +482,7 @@ with gr.Blocks(theme=gr.themes.Base(), css=css, title="Breathing Pattern Classif
             stop_btn.click(stop_stream, [], [stream_status])
             refresh_btn.click(refresh_live, [], [live_plot, live_result])
 
-        with gr.TabItem("📖 How to Use"):
+        with gr.TabItem("How to Use"):
             gr.Markdown("""
 ## Recording with PhyPhox
 1. Open PhyPhox → **Acceleration (without g)** experiment
@@ -471,19 +490,19 @@ with gr.Blocks(theme=gr.themes.Base(), css=css, title="Breathing Pattern Classif
 3. Press **Record** for 10–15 seconds
 4. Export → **CSV** → share the `Accelerometer.csv` to your laptop
 5. Upload it in the **Classify Recording** tab
-
+---
 ## CSV Format (PhyPhox output)
 ```
 time, seconds_elapsed, x, y, z
 ```
 - `x`, `y`, `z` — acceleration in m/s²
 - Sampling rate: ~100 Hz
-
+---
 ## Live Stream
 - Uses PhyPhox Remote Access over WiFi — no USB needed
 - Click **Refresh** to pull the latest data and get a new prediction
 - The model classifies the most recent 10-second window
-
+---
 ## Model
 - **Features**: 15 audio + 15 accel = 30 total
 - **Classes**: Passive (resting) vs Active (post-exercise)
