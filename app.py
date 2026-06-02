@@ -1,11 +1,10 @@
 """
 Breathing Pattern Classification — Demo App
-Run in Colab with:
-    !pip install gradio -q
-    !python gradio_app.py
-Or inline:
-    import gradio as gr
-    # (paste this file's contents into a cell)
+Run with: python app.py
+Then open the local URL printed in terminal.
+
+Install deps:
+    pip install gradio matplotlib numpy scipy requests scikit-learn librosa
 """
 
 import gradio as gr
@@ -13,19 +12,25 @@ import numpy as np
 import pandas as pd
 import pickle
 import librosa
+import threading
+import time
+import requests
+import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from collections import deque
 from scipy.fft import fft, fftfreq
-import os
 
-# ── Constants (must match training config) ────────────────────────────────────
-AUDIO_SR    = 22050
-N_MFCC      = 13
-ACCEL_SR    = 100
-BREATH_LOW  = 0.1
-BREATH_HIGH = 0.5
-CLASS_NAMES = ['Passive (Resting)', 'Active (Post-Exercise)']
+# ── Constants ────────────────────────────────────────────────────────────────
+AUDIO_SR     = 22050
+N_MFCC       = 13
+ACCEL_SR     = 100
+BREATH_LOW   = 0.1
+BREATH_HIGH  = 0.5
+WINDOW_SEC   = 10
+CLASS_NAMES  = ['Passive (Resting)', 'Active (Post-Exercise)']
+COLORS       = ['#4ecdc4', '#ff6b6b']
 
 AUDIO_FEATURE_NAMES = (
     [f'mfcc_{i}_mean' for i in range(N_MFCC)] +
@@ -41,15 +46,13 @@ ALL_FEATURE_NAMES = AUDIO_FEATURE_NAMES + ACCEL_FEATURE_NAMES
 # ── Load model + scaler ───────────────────────────────────────────────────────
 def load_artifacts():
     model, scaler = None, None
-    for model_path in ['/content/best_model.pkl', './best_model.pkl']:
-        if os.path.exists(model_path):
-            with open(model_path, 'rb') as f:
-                model = pickle.load(f)
+    for p in ['./content/best_model.pkl', './best_model.pkl']:
+        if os.path.exists(p):
+            with open(p, 'rb') as f: model = pickle.load(f)
             break
-    for scaler_path in ['/content/scaler.pkl', './scaler.pkl']:
-        if os.path.exists(scaler_path):
-            with open(scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
+    for p in ['./content/scaler.pkl', './scaler.pkl']:
+        if os.path.exists(p):
+            with open(p, 'rb') as f: scaler = pickle.load(f)
             break
     return model, scaler
 
@@ -58,290 +61,442 @@ model, scaler = load_artifacts()
 # ── Feature extraction ────────────────────────────────────────────────────────
 def extract_audio_features(file_path):
     audio, sr = librosa.load(file_path, sr=AUDIO_SR)
-    mfccs     = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC)
-    centroid  = librosa.feature.spectral_centroid(y=audio, sr=sr)
-    zcr       = librosa.feature.zero_crossing_rate(audio)
-    return np.hstack([
-        np.mean(mfccs, axis=1),
-        np.mean(centroid),
-        np.mean(zcr),
-    ])
+    mfccs    = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC)
+    centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)
+    zcr      = librosa.feature.zero_crossing_rate(audio)
+    return np.hstack([np.mean(mfccs, axis=1), np.mean(centroid), np.mean(zcr)])
 
-def extract_accel_features(df):
-    magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2).values
-    time_features = np.array([
+def extract_accel_features_arr(x_arr, y_arr, z_arr):
+    x, y, z   = np.array(x_arr), np.array(y_arr), np.array(z_arr)
+    magnitude = np.sqrt(x**2 + y**2 + z**2)
+    time_feat = np.array([
         np.mean(magnitude), np.std(magnitude),
         np.max(magnitude),  np.min(magnitude),
-        np.max(magnitude) - np.min(magnitude),
-        np.var(magnitude),
-        np.mean(df['x']), np.std(df['x']),
-        np.mean(df['y']), np.std(df['y']),
-        np.mean(df['z']), np.std(df['z']),
+        np.max(magnitude) - np.min(magnitude), np.var(magnitude),
+        np.mean(x), np.std(x), np.mean(y), np.std(y), np.mean(z), np.std(z),
     ])
-    n         = len(magnitude)
-    freqs     = fftfreq(n, d=1.0 / ACCEL_SR)
-    fft_mag   = np.abs(fft(magnitude))
-    pos_mask  = freqs > 0
-    freqs_pos = freqs[pos_mask]
-    fft_pos   = fft_mag[pos_mask]
-    breath_mask  = (freqs_pos >= BREATH_LOW) & (freqs_pos <= BREATH_HIGH)
-    total_power  = np.sum(fft_pos) + 1e-8
-    if breath_mask.sum() > 0:
-        breath_power  = np.sum(fft_pos[breath_mask])
-        dominant_freq = freqs_pos[breath_mask][np.argmax(fft_pos[breath_mask])]
-    else:
-        breath_power, dominant_freq = 0.0, 0.0
-    return np.array([*time_features, dominant_freq, breath_power, breath_power / total_power])
+    n = len(magnitude)
+    freqs    = fftfreq(n, d=1.0 / ACCEL_SR)
+    fft_mag  = np.abs(fft(magnitude))
+    pos      = freqs > 0
+    fp, fm   = freqs[pos], fft_mag[pos]
+    bm       = (fp >= BREATH_LOW) & (fp <= BREATH_HIGH)
+    tp       = np.sum(fm) + 1e-8
+    bp       = np.sum(fm[bm]) if bm.sum() > 0 else 0.0
+    df       = fp[bm][np.argmax(fm[bm])] if bm.sum() > 0 else 0.0
+    return np.array([*time_feat, df, bp, bp / tp])
 
-# ── Signal visualization ──────────────────────────────────────────────────────
-def plot_accel_signal(df):
-    t         = df['seconds_elapsed'].values
-    magnitude = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2).values
+def extract_accel_features_df(df):
+    return extract_accel_features_arr(df['x'].values, df['y'].values, df['z'].values)
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), facecolor='#0f1117')
-    fig.suptitle('Accelerometer Signal Analysis', color='white', fontsize=14, fontweight='bold', y=0.98)
+def run_model(audio_feat, accel_feat):
+    if model is None:
+        return None, None
+    af = audio_feat if audio_feat is not None else np.zeros(len(AUDIO_FEATURE_NAMES))
+    ef = accel_feat if accel_feat is not None else np.zeros(len(ACCEL_FEATURE_NAMES))
+    fused = np.concatenate([af, ef]).reshape(1, -1)
+    if scaler is not None:
+        fused = scaler.transform(fused)
+    pred   = model.predict(fused)[0]
+    proba  = model.predict_proba(fused)[0] if hasattr(model, 'predict_proba') else [0.5, 0.5]
+    return int(pred), float(proba[pred])
 
-    # Raw axes
-    ax = axes[0]
-    ax.set_facecolor('#1a1d27')
-    for col, color in zip(['x', 'y', 'z'], ['#ff6b6b', '#4ecdc4', '#ffe66d']):
-        ax.plot(t, df[col], label=col.upper(), color=color, linewidth=1.2, alpha=0.9)
-    ax.set_ylabel('Accel (m/s²)', color='#aaaaaa', fontsize=9)
-    ax.set_title('Raw X / Y / Z', color='white', fontsize=10)
-    ax.legend(loc='upper right', fontsize=8, framealpha=0.3)
-    ax.tick_params(colors='#777777')
-    for spine in ax.spines.values():
-        spine.set_color('#333344')
+# ── Plotting helpers ──────────────────────────────────────────────────────────
+PLOT_STYLE = dict(facecolor='#0f1117')
+AX_STYLE   = '#1a1d27'
+SPINE_COL  = '#333344'
 
-    # Magnitude
-    ax = axes[1]
-    ax.set_facecolor('#1a1d27')
-    ax.plot(t, magnitude, color='#a78bfa', linewidth=1.4)
-    ax.fill_between(t, magnitude, alpha=0.15, color='#a78bfa')
-    ax.set_ylabel('Magnitude (m/s²)', color='#aaaaaa', fontsize=9)
-    ax.set_title('Signal Magnitude', color='white', fontsize=10)
-    ax.tick_params(colors='#777777')
-    for spine in ax.spines.values():
-        spine.set_color('#333344')
+def _style_ax(ax):
+    ax.set_facecolor(AX_STYLE)
+    ax.tick_params(colors='#777777', labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_color(SPINE_COL)
 
-    # FFT
-    ax = axes[2]
-    ax.set_facecolor('#1a1d27')
-    n         = len(magnitude)
-    freqs     = fftfreq(n, d=1.0 / ACCEL_SR)
-    fft_mag   = np.abs(fft(magnitude))
-    pos_mask  = freqs > 0
-    ax.plot(freqs[pos_mask], fft_mag[pos_mask], color='#34d399', linewidth=1.2)
+def make_signal_fig(t, x, y, z, title="Accelerometer Signal"):
+    mag = np.sqrt(np.array(x)**2 + np.array(y)**2 + np.array(z)**2)
+    t   = np.array(t)
+    t_rel = t - t[0]
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 7), **PLOT_STYLE)
+    fig.suptitle(title, color='white', fontsize=13, fontweight='bold', y=0.99)
+
+    ax = axes[0]; _style_ax(ax)
+    for arr, col, lbl in zip([x, y, z], ['#ff6b6b','#4ecdc4','#ffe66d'], ['X','Y','Z']):
+        ax.plot(t_rel, arr, color=col, lw=1.1, alpha=0.9, label=lbl)
+    ax.set_ylabel('m/s²', color='#aaa', fontsize=8)
+    ax.set_title('Raw X / Y / Z', color='white', fontsize=9)
+    ax.legend(loc='upper right', fontsize=7, framealpha=0.2)
+
+    ax = axes[1]; _style_ax(ax)
+    ax.plot(t_rel, mag, color='#a78bfa', lw=1.3)
+    ax.fill_between(t_rel, mag, alpha=0.12, color='#a78bfa')
+    ax.set_ylabel('m/s²', color='#aaa', fontsize=8)
+    ax.set_title('Magnitude', color='white', fontsize=9)
+
+    ax = axes[2]; _style_ax(ax)
+    n      = len(mag)
+    freqs  = fftfreq(n, d=1.0 / ACCEL_SR)
+    fm     = np.abs(fft(mag))
+    pos    = freqs > 0
+    ax.plot(freqs[pos], fm[pos], color='#34d399', lw=1.1)
     ax.axvspan(BREATH_LOW, BREATH_HIGH, alpha=0.2, color='#34d399',
-               label=f'Breathing band ({BREATH_LOW}–{BREATH_HIGH} Hz)')
+               label=f'{BREATH_LOW}–{BREATH_HIGH} Hz breathing band')
     ax.set_xlim(0, 2)
-    ax.set_xlabel('Frequency (Hz)', color='#aaaaaa', fontsize=9)
-    ax.set_ylabel('Amplitude', color='#aaaaaa', fontsize=9)
-    ax.set_title('FFT — Breathing Band Highlighted', color='white', fontsize=10)
-    ax.legend(fontsize=8, framealpha=0.3, labelcolor='white')
-    ax.tick_params(colors='#777777')
-    for spine in ax.spines.values():
-        spine.set_color('#333344')
+    ax.set_xlabel('Frequency (Hz)', color='#aaa', fontsize=8)
+    ax.set_title('FFT — Breathing Band Highlighted', color='white', fontsize=9)
+    ax.legend(fontsize=7, framealpha=0.2, labelcolor='white')
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     return fig
 
-def plot_feature_bar(features, feature_names, prediction, confidence):
-    fig, ax = plt.subplots(figsize=(10, 5), facecolor='#0f1117')
-    ax.set_facecolor('#1a1d27')
-
-    color = '#4ecdc4' if prediction == 0 else '#ff6b6b'
-    bars  = ax.barh(feature_names, np.abs(features), color=color, alpha=0.75, height=0.6)
-
-    ax.set_xlabel('|Feature Value|', color='#aaaaaa', fontsize=9)
-    ax.set_title(
-        f'Feature Values  |  Prediction: {CLASS_NAMES[prediction]}  ({confidence:.1%} confidence)',
-        color='white', fontsize=11, fontweight='bold'
-    )
-    ax.tick_params(colors='#777777', labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_color('#333344')
+def make_feature_fig(audio_feat, accel_feat, pred_idx, confidence):
+    features = np.concatenate([
+        audio_feat if audio_feat is not None else np.zeros(len(AUDIO_FEATURE_NAMES)),
+        accel_feat if accel_feat is not None else np.zeros(len(ACCEL_FEATURE_NAMES)),
+    ])
+    color = COLORS[pred_idx] if pred_idx is not None else '#888'
+    fig, ax = plt.subplots(figsize=(10, 5), **PLOT_STYLE)
+    _style_ax(ax)
+    ax.barh(ALL_FEATURE_NAMES, np.abs(features), color=color, alpha=0.75, height=0.6)
+    ax.set_xlabel('|Feature Value|', color='#aaa', fontsize=9)
+    title = (f'Features  |  {CLASS_NAMES[pred_idx]}  ({confidence:.1%} confidence)'
+             if pred_idx is not None else 'Feature Values')
+    ax.set_title(title, color='white', fontsize=10, fontweight='bold')
     plt.tight_layout()
     return fig
 
-# ── Main prediction function ──────────────────────────────────────────────────
-def predict(audio_file, accel_file):
+# ─────────────────────────────────────────────────────────────────────────────
+# LIVE STREAM STATE
+# ─────────────────────────────────────────────────────────────────────────────
+class LiveState:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        buf = WINDOW_SEC * ACCEL_SR * 3
+        self.t_buf       = deque(maxlen=buf)
+        self.x_buf       = deque(maxlen=buf)
+        self.y_buf       = deque(maxlen=buf)
+        self.z_buf       = deque(maxlen=buf)
+        self.running     = False
+        self.last_time   = 0.0
+        self.pred_idx    = None
+        self.confidence  = 0.0
+        self.status      = "Idle"
+        self.thread      = None
+
+live = LiveState()
+
+def _to_float_array(val):
+    """
+    Convert PhyPhox buffer data into a numpy float array.
+
+    Handles:
+      [1,2,3]
+      {"buffer":[1,2,3]}
+      [{"buffer":1}, {"buffer":2}]
+      0 / None
+    """
+    if val is None or val == 0:
+        return None
+
+    # {"buffer":[...]}
+    if isinstance(val, dict):
+        if "buffer" in val:
+            return np.array(val["buffer"], dtype=float)
+        return None
+
+    # [1,2,3]
+    if isinstance(val, list):
+        if len(val) == 0:
+            return None
+
+        # [{"buffer":1}, ...]
+        if isinstance(val[0], dict):
+            return np.array(
+                [v.get("buffer", 0.0) for v in val],
+                dtype=float
+            )
+
+        return np.array(val, dtype=float)
+
+    return None
+
+def _poll_loop(ip: str):
+    base = f"http://{ip}"
+
+    while live.running:
+
+        try:
+
+            r = requests.get(
+                f"{base}/get?accX=full&accY=full&accZ=full&acc_time=full",
+                timeout=2
+            )
+
+            if r.status_code != 200:
+                live.status = f"PhyPhox returned {r.status_code}"
+                time.sleep(0.25)
+                continue
+
+            data = r.json()
+
+            buf = data.get("buffer", {})
+
+            raw_t = buf.get("acc_time")
+            raw_x = buf.get("accX")
+            raw_y = buf.get("accY")
+            raw_z = buf.get("accZ")
+
+            t = _to_float_array(raw_t)
+            x = _to_float_array(raw_x)
+            y = _to_float_array(raw_y)
+            z = _to_float_array(raw_z)
+
+            if any(v is None for v in [t, x, y, z]):
+                live.status = (
+                    "Waiting for data. "
+                    "Make sure PhyPhox is running and the experiment is recording."
+                )
+                time.sleep(0.25)
+                continue
+
+            min_len = min(len(t), len(x), len(y), len(z))
+
+            if min_len == 0:
+                live.status = "No accelerometer samples yet."
+                time.sleep(0.25)
+                continue
+
+            t = t[-min_len:]
+            x = x[-min_len:]
+            y = y[-min_len:]
+            z = z[-min_len:]
+
+            if live.last_time == 0:
+                new_mask = np.ones(len(t), dtype=bool)
+            else:
+                new_mask = t > live.last_time
+
+            if np.any(new_mask):
+
+                live.t_buf.extend(t[new_mask].tolist())
+                live.x_buf.extend(x[new_mask].tolist())
+                live.y_buf.extend(y[new_mask].tolist())
+                live.z_buf.extend(z[new_mask].tolist())
+
+                live.last_time = float(t[new_mask][-1])
+
+                live.status = (
+                    f"Streaming — "
+                    f"{len(live.t_buf)} samples collected"
+                )
+
+            else:
+                live.status = "Connected — waiting for new samples"
+
+        except Exception as e:
+            live.status = f"Connection error: {str(e)}"
+
+        time.sleep(0.1)
+
+def start_stream(ip):
+    if not ip or not ip.strip():
+        return "⚠️ Enter a PhyPhox IP address first."
+    ip = ip.strip()
+    if live.running:
+        return "Already streaming. Stop first."
+    try:
+        r = requests.get(f"http://{ip}/config", timeout=3)
+        if r.status_code != 200:
+            return f"❌ Could not connect to http://{ip} — check the IP and that Remote Access is on."
+    except Exception as e:
+        return f"❌ Could not reach http://{ip}: {e}"
+
+    live.reset()
+    live.running = True
+    live.thread  = threading.Thread(target=_poll_loop, args=(ip,), daemon=True)
+    live.thread.start()
+    return f"✅ Connected to {ip} — press Play in PhyPhox. The graph will update automatically."
+
+def stop_stream():
+    live.running = False
+    live.status  = "Stopped"
+    return "Stream stopped."
+
+def refresh_live():
+
+    if len(live.t_buf) < 20:
+        return None, f"No usable data yet — {live.status}"
+    
+    display_sec = 5
+    win = display_sec * ACCEL_SR
+    t = list(live.t_buf)[-win:]
+    x = list(live.x_buf)[-win:]
+    y = list(live.y_buf)[-win:]
+    z = list(live.z_buf)[-win:]
+
+    fig = make_signal_fig(t, x, y, z, title="Live Accelerometer Signal (PhyPhox)")
+
+    if len(t) >= ACCEL_SR * 2:
+        accel_feat      = extract_accel_features_arr(x, y, z)
+        pred, conf      = run_model(None, accel_feat)
+        live.pred_idx   = pred
+        live.confidence = conf
+
+    if live.pred_idx is not None:
+        emoji  = "🧘" if live.pred_idx == 0 else "🏃"
+        label  = CLASS_NAMES[live.pred_idx]
+        result = f"{emoji} **{label}**\nConfidence: {live.confidence:.1%}\n\n_{live.status}_"
+    else:
+        result = f"_Collecting data... ({live.status})_"
+
+    return fig, result
+
+# ── Tab 1: Classify uploaded recording ───────────────────────────────────────
+def predict_uploaded(audio_file, accel_file):
     if model is None:
-        return (
-            "⚠️ No model found. Run the training notebook first to generate best_model.pkl",
-            None, None, None
-        )
+        return "⚠️ No model found — run the training notebook first.", None, None, None
 
-    errors = []
+    errors, audio_feat, accel_feat, accel_plot, feat_table = [], None, None, None, None
 
-    # Audio features
-    audio_feat = None
-    if audio_file is not None:
+    if audio_file:
         try:
             audio_feat = extract_audio_features(audio_file)
         except Exception as e:
             errors.append(f"Audio error: {e}")
 
-    # Accel features + plot
-    accel_feat = None
-    accel_plot = None
-    feature_table = None
-
-    if accel_file is not None:
+    if accel_file:
         try:
             df = pd.read_csv(accel_file)
-            # Validate columns
-            missing = [c for c in ['x', 'y', 'z', 'seconds_elapsed'] if c not in df.columns]
+            missing = [c for c in ['x','y','z','seconds_elapsed'] if c not in df.columns]
             if missing:
-                errors.append(f"CSV missing columns: {missing}. Expected: time, seconds_elapsed, x, y, z")
+                errors.append(f"CSV missing columns: {missing}")
             else:
-                accel_feat = extract_accel_features(df)
-                accel_plot = plot_accel_signal(df)
-
-                # Feature table
-                feature_table = pd.DataFrame({
+                accel_feat = extract_accel_features_df(df)
+                accel_plot = make_signal_fig(
+                    df['seconds_elapsed'].values,
+                    df['x'].values, df['y'].values, df['z'].values
+                )
+                feat_table = pd.DataFrame({
                     'Feature': ACCEL_FEATURE_NAMES,
                     'Value':   [f'{v:.4f}' for v in accel_feat]
                 })
         except Exception as e:
             errors.append(f"Accel error: {e}")
 
-    # Build fused feature vector
     if audio_feat is None and accel_feat is None:
-        return "Upload at least one file to get a prediction.", None, None, None
+        return "Upload at least one file.", None, None, None
 
-    if audio_feat is None:
-        audio_feat = np.zeros(len(AUDIO_FEATURE_NAMES))
-        errors.append("⚠️ No audio file — audio features set to zero")
-    if accel_feat is None:
-        accel_feat = np.zeros(len(ACCEL_FEATURE_NAMES))
-        errors.append("⚠️ No accel file — accel features set to zero")
+    pred, conf = run_model(audio_feat, accel_feat)
+    if pred is None:
+        return "⚠️ Model error.", accel_plot, None, feat_table
 
-    fused = np.concatenate([audio_feat, accel_feat]).reshape(1, -1)
-
-    if scaler is not None:
-        fused = scaler.transform(fused)
-
-    pred       = model.predict(fused)[0]
-    proba      = model.predict_proba(fused)[0] if hasattr(model, 'predict_proba') else [0.5, 0.5]
-    confidence = proba[pred]
-
-    label = CLASS_NAMES[pred]
     emoji = "🧘" if pred == 0 else "🏃"
-
-    result_text = f"{emoji}  **{label}**\nConfidence: {confidence:.1%}"
+    text  = f"{emoji} **{CLASS_NAMES[pred]}**\nConfidence: {conf:.1%}"
     if errors:
-        result_text += "\n\n" + "\n".join(errors)
+        text += "\n\n" + "\n".join(errors)
 
-    feat_plot = plot_feature_bar(
-        np.concatenate([audio_feat.flatten(), accel_feat.flatten()]),
-        ALL_FEATURE_NAMES, pred, confidence
-    )
-
-    return result_text, accel_plot, feat_plot, feature_table
-
-# ── Accel-only live preview (CSV upload → signal plot, no model needed) ───────
-def preview_signal(accel_file):
-    if accel_file is None:
-        return None, "Upload a CSV file to preview the signal."
-    try:
-        df = pd.read_csv(accel_file)
-        missing = [c for c in ['x', 'y', 'z', 'seconds_elapsed'] if c not in df.columns]
-        if missing:
-            return None, f"Missing columns: {missing}"
-        fig = plot_accel_signal(df)
-        feats = extract_accel_features(df)
-        summary = "\n".join([f"{n}: {v:.4f}" for n, v in zip(ACCEL_FEATURE_NAMES, feats)])
-        return fig, f"**Extracted Features:**\n```\n{summary}\n```"
-    except Exception as e:
-        return None, f"Error: {e}"
+    feat_fig = make_feature_fig(audio_feat, accel_feat, pred, conf)
+    return text, accel_plot, feat_fig, feat_table
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 css = """
-body { background: #0f1117; }
-.gradio-container { font-family: 'JetBrains Mono', monospace; background: #0f1117; }
-.tab-nav { background: #1a1d27; border-bottom: 1px solid #333; }
-.result-box { background: #1a1d27; border: 1px solid #333344; border-radius: 8px; padding: 16px; }
-h1 { color: white; letter-spacing: -0.5px; }
+body, .gradio-container { background: #0f1117 !important; }
+.tab-nav button { background: #1a1d27 !important; color: #aaa !important; }
+.tab-nav button.selected { color: white !important; border-bottom: 2px solid #a78bfa !important; }
+.result-box { background: #1a1d27; border: 1px solid #333344; border-radius: 8px; padding: 16px; color: white; }
+footer { display: none !important; }
 """
 
 with gr.Blocks(theme=gr.themes.Base(), css=css, title="Breathing Pattern Classifier") as demo:
+
     gr.Markdown("""
-    # 🫁 Breathing Pattern Classifier
-    **ML & Sensing Final Project** — Maanvi Sarwadi, Katie Jiang, Aanand Patel, Alina Zacaria, Hayah Ubaid
-    
-    Upload an **Accelerometer.csv** from PhyPhox (and optionally a **.wav** audio file) to classify as **Resting** or **Active** breathing.
-    """)
+# 🫁 Breathing Pattern Classifier
+**ML & Sensing Final Project** — Maanvi Sarwadi, Katie Jiang, Aanand Patel, Alina Zacaria, Hayah Ubaid
+""")
 
     with gr.Tabs():
 
-        # ── Tab 1: Full prediction ────────────────────────────────────────────
         with gr.TabItem("🔬 Classify Recording"):
+            gr.Markdown("Upload an `Accelerometer.csv` from PhyPhox and optionally a `.wav` audio file.")
             with gr.Row():
                 with gr.Column(scale=1):
-                    accel_input = gr.File(label="Accelerometer CSV (PhyPhox)", file_types=[".csv"])
-                    audio_input = gr.File(label="Audio File (optional)", file_types=[".wav", ".m4a", ".mp3"])
-                    predict_btn = gr.Button("Classify", variant="primary")
-
+                    accel_input   = gr.File(label="Accelerometer CSV (PhyPhox)", file_types=[".csv"])
+                    audio_input   = gr.File(label="Audio File (optional)", file_types=[".wav",".m4a",".mp3"])
+                    predict_btn   = gr.Button("Classify", variant="primary")
                 with gr.Column(scale=1):
-                    result_out = gr.Markdown(label="Prediction", elem_classes=["result-box"])
+                    result_out    = gr.Markdown(elem_classes=["result-box"])
+            accel_plot_out    = gr.Plot(label="Accelerometer Signal")
+            feature_plot_out  = gr.Plot(label="Feature Importance")
+            feature_table_out = gr.Dataframe(label="Accel Features", headers=["Feature","Value"])
+            predict_btn.click(predict_uploaded,
+                              [audio_input, accel_input],
+                              [result_out, accel_plot_out, feature_plot_out, feature_table_out])
 
-            accel_plot_out  = gr.Plot(label="Accelerometer Signal")
-            feature_plot_out = gr.Plot(label="Feature Values")
-            feature_table_out = gr.Dataframe(label="Accel Feature Values", headers=["Feature", "Value"])
-
-            predict_btn.click(
-                fn=predict,
-                inputs=[audio_input, accel_input],
-                outputs=[result_out, accel_plot_out, feature_plot_out, feature_table_out]
-            )
-
-        # ── Tab 2: Signal preview only ────────────────────────────────────────
-        with gr.TabItem("📈 Preview Signal"):
+        with gr.TabItem("📡 Live Stream (PhyPhox)"):
             gr.Markdown("""
-            Upload any **Accelerometer.csv** to visualize the raw signal and extracted features — 
-            no model needed. Useful for checking your PhyPhox recordings before classifying.
-            """)
-            preview_input = gr.File(label="Accelerometer CSV", file_types=[".csv"])
-            preview_btn   = gr.Button("Preview", variant="secondary")
-            preview_plot  = gr.Plot(label="Signal Visualization")
-            preview_text  = gr.Markdown()
+**How to connect:**
+1. Open PhyPhox → *Acceleration (without g)* → tap **⋮ → Remote Access**
+2. Note the IP shown (e.g. `192.168.1.5`) — phone and laptop must be on the **same WiFi**
+3. Enter the IP below, click **Start**, then press **Play** in PhyPhox
+4. Click **Refresh** to pull the latest data and get a new prediction
+""")
+            with gr.Row():
+                ip_input    = gr.Textbox(label="PhyPhox IP Address", placeholder="e.g. 192.168.1.5", scale=3)
+                start_btn   = gr.Button("▶ Start", variant="primary", scale=1)
+                stop_btn    = gr.Button("⏹ Stop", variant="secondary", scale=1)
+                refresh_btn = gr.Button("🔄 Refresh", variant="secondary", scale=1)
 
-            preview_btn.click(
-                fn=preview_signal,
-                inputs=[preview_input],
-                outputs=[preview_plot, preview_text]
+            stream_status = gr.Markdown("_Stream idle_")
+            live_plot     = gr.Plot(label="Live Signal")
+            live_result   = gr.Markdown(elem_classes=["result-box"])
+
+            timer = gr.Timer(value=0.25)
+            timer.tick(
+                refresh_live,
+                inputs=[],
+                outputs=[live_plot, live_result]
             )
 
-        # ── Tab 3: How to use ─────────────────────────────────────────────────
+            start_btn.click(start_stream, [ip_input], [stream_status])
+            stop_btn.click(stop_stream, [], [stream_status])
+            refresh_btn.click(refresh_live, [], [live_plot, live_result])
+
         with gr.TabItem("📖 How to Use"):
             gr.Markdown("""
-            ## Recording with PhyPhox
-            1. Open PhyPhox → **Acceleration (without g)** experiment
-            2. Place phone **flat on your diaphragm** (chest/stomach)
-            3. Press **Record** and breathe normally for 10–15 seconds (resting) or record right after exercise (active)
-            4. Export → **CSV** → share to your computer
-            5. Upload the `Accelerometer.csv` in the **Classify** tab
+## Recording with PhyPhox
+1. Open PhyPhox → **Acceleration (without g)** experiment
+2. Place phone **flat on your diaphragm** (chest/stomach)
+3. Press **Record** for 10–15 seconds
+4. Export → **CSV** → share the `Accelerometer.csv` to your laptop
+5. Upload it in the **Classify Recording** tab
 
-            ## CSV Format Expected
-            PhyPhox exports a CSV with these columns:
-            ```
-            time, seconds_elapsed, x, y, z
-            ```
-            - `x`, `y`, `z` — acceleration in m/s²
-            - `seconds_elapsed` — time axis for plots
-            - Sampling rate: ~100 Hz
+## CSV Format (PhyPhox output)
+```
+time, seconds_elapsed, x, y, z
+```
+- `x`, `y`, `z` — acceleration in m/s²
+- Sampling rate: ~100 Hz
 
-            ## Model Info
-            - **Features**: 15 audio (MFCCs, spectral centroid, ZCR) + 15 accel (time-domain + FFT breathing band)
-            - **Models trained**: Random Forest, Logistic Regression
-            - **Classes**: Passive (resting) vs Active (post-exercise)
-            
-            ## Notes on 100% Accuracy
-            The model currently achieves perfect scores because resting vs. post-exercise states 
-            are very physically distinct. Future work: classify subtle breathing irregularities 
-            within the same activity state for a harder and more clinically meaningful task.
-            """)
+## Live Stream
+- Uses PhyPhox Remote Access over WiFi — no USB needed
+- Click **Refresh** to pull the latest data and get a new prediction
+- The model classifies the most recent 10-second window
+
+## Model
+- **Features**: 15 audio + 15 accel = 30 total
+- **Classes**: Passive (resting) vs Active (post-exercise)
+- Model files expected at `./best_model.pkl` and `./scaler.pkl`
+""")
 
 if __name__ == "__main__":
-    demo.launch(share=True, debug=True)
+    print("\n🫁 Breathing Pattern Classifier")
+    print("=" * 40)
+    if model:
+        print("✅ Model loaded")
+    else:
+        print("⚠️  No model found — run training notebook first")
+        print("   Expected: ./best_model.pkl and ./scaler.pkl")
+    print("=" * 40)
+    demo.launch(share=True)
