@@ -369,6 +369,14 @@ def predict_uploaded(audio_file, accel_file):
     if accel_file:
         try:
             df = pd.read_csv(accel_file)
+            
+            df = df.rename(columns={
+                'Time (s)': 'seconds_elapsed',
+                'Linear Acceleration x (m/s^2)': 'x',
+                'Linear Acceleration y (m/s^2)': 'y',
+                'Linear Acceleration z (m/s^2)': 'z'
+            })
+
             missing = [c for c in ['x','y','z','seconds_elapsed'] if c not in df.columns]
             if missing:
                 errors.append(f"CSV missing columns: {missing}")
@@ -471,7 +479,7 @@ with gr.Blocks(theme=gr.Theme.from_hub("Nymbo/Nymbo_Theme"), css=css, title="Bre
             live_plot     = gr.Plot(label="Live Signal")
             live_result   = gr.Markdown(elem_classes=["result-box"])
 
-            timer = gr.Timer(value=0.25)
+            timer = gr.Timer(value=0.1)
             timer.tick(
                 refresh_live,
                 inputs=[],
